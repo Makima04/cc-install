@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     一键安装 Claude Code + Codex + cc-switch（Windows PowerShell）
 .DESCRIPTION
@@ -440,8 +440,7 @@ function Uninstall-CcSwitch {
                 Where-Object { $_.DisplayName -match 'CC ?Switch|cc-switch' } |
                 Select-Object -First 1
             if ($entry -and $entry.UninstallString) {
-                $uninst = $entry.UninstallString -replace '^"', '' -replace '"
-, ''
+                $uninst = $entry.UninstallString -replace '^"', '' -replace '"$', ''
                 Write-Log "通过 MSI 卸载：$($entry.DisplayName)"
                 # 静默卸载（/qb 带 UI，/qn 无 UI）
                 $args = @('/x', "`"$($entry.PSChildName)`"", '/qb', '/norestart')
@@ -515,10 +514,8 @@ function Show-Menu {
 function Resolve-Action {
     param([string]$Arg)
     switch -Regex ($Arg) {
-        '^(install|uninstall|check)
- { return $Arg }
-        '^
-  { }                      # 落到交互
+        '^(install|uninstall|check)$' { return $Arg }
+        '^$' { }                      # 落到交互
         '.'  {
             Write-Err2 "未知参数：$Arg"
             Write-Err2 '用法：.\install.ps1 [install|uninstall|check]'
@@ -531,14 +528,10 @@ function Resolve-Action {
         Show-Menu
         $choice = Read-Host '请输入选项 [1-3/q]'
         switch -Regex ($choice) {
-            '^(1|i|install)
-   { return 'install' }
-            '^(2|u|uninstall)
- { return 'uninstall' }
-            '^(3|c|check)
-     { return 'check' }
-            '^(q|quit|exit)
-   { return 'exit' }
+            '^(1|i|install)$'    { return 'install' }
+            '^(2|u|uninstall)$'  { return 'uninstall' }
+            '^(3|c|check)$'      { return 'check' }
+            '^(q|quit|exit)$'    { return 'exit' }
             default { Write-Warn2 '无效输入，请重选' }
         }
     }
