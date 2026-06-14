@@ -37,7 +37,7 @@ bash install.sh
 ### Windows（PowerShell）
 
 ```powershell
-irm https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1 | iex
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1).TrimStart([char]0xFEFF)))
 ```
 
 或本地运行：

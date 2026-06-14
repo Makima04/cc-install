@@ -8,7 +8,7 @@
     要求：Windows 10/11，PowerShell 5.1+（或 PowerShell 7+）
 .EXAMPLE
     # 一行命令（推荐）
-    irm https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1 | iex
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1).TrimStart([char]0xFEFF)))
 
     # 本地运行
     powershell -ExecutionPolicy Bypass -File .\install.ps1
