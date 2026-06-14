@@ -1,0 +1,15 @@
+# 强制脚本与文本文件使用 LF 换行符,避免在 macOS/Linux 上执行时因 CRLF 报错
+*.sh        text eol=lf
+*.ps1       text eol=crlf
+*.psm1      text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# 其他文本默认按平台处理,但 Markdown / 配置类统一 LF
+*.md        text eol=lf
+*.json      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.txt       text eol=lf
+Dockerfile  text eol=lf

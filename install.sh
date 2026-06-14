@@ -321,14 +321,67 @@ configure_npm() {
 }
 
 # ----------------------------- 安装 npm 全局包 -----------------------------
+# 带 EACCES → sudo 自动 fallback 的 npm 全局安装。
+# 触发条件：首次安装失败，且输出含 EACCES（npm 全局目录归 root，普通用户无写权限）。
+# 行为：
+#   - 交互模式：询问是否用 sudo 重试，同意则 sudo 重装
+#   - 非交互模式：打印手动 sudo 命令，让用户自行执行（管道 bash 场景无法输密码）
 npm_install_global() {
   local pkg="$1"
   section "安装 $pkg"
   log "npm install -g $pkg"
-  if npm install -g "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
+
+  # 用临时文件捕获输出，避免 `$(...)` 在管道下丢失退出码。
+  # if 条件里的命令失败不会触发 set -e，可直接用 ! 取反判断。
+  local tmpout; tmpout="$(mktemp)"
+  if npm install -g "$pkg" >"$tmpout" 2>&1; then
+    cat "$tmpout" | tee -a "$LOG_FILE"   # 成功：回显 + 记日志
+    rm -f "$tmpout"
     ok "$pkg 安装完成"
-  else
+    return 0
+  fi
+  # 失败：回显输出 + 记日志，再按错误类型分流
+  cat "$tmpout" | tee -a "$LOG_FILE"
+  local out; out="$(<"$tmpout")"
+  rm -f "$tmpout"
+
+  # 非 EACCES 错误（网络/包不存在等）直接失败
+  if ! grep -qiE 'EACCES|permission denied' <<<"$out"; then
     die "安装 $pkg 失败"
+  fi
+
+  # EACCES：npm 全局目录无写权限，尝试 sudo fallback
+  warn "检测到权限不足（EACCES）：npm 全局目录 $(npm config get prefix 2>/dev/null) 无写权限"
+  if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
+    # 管道 / 非交互场景无法输 sudo 密码，给出手动命令
+    # 注意：sudo 切到 root 后读不到当前用户 ~/.npmrc 里的镜像配置，
+    #       必须显式 --registry 指定，否则会走官方源龟速下载。
+    err "无法在此自动使用 sudo（非交互模式），请手动执行："
+    printf '    %ssudo npm install -g %s --registry=%s%s\n' \
+      "$c_bold" "$pkg" "$NPM_REGISTRY" "$color_reset"
+    die "安装 $pkg 失败（需要 sudo 权限）"
+  fi
+
+  if confirm "是否用 sudo 重新安装（会要求输入密码）"; then
+    # sudo 切到 root 后读不到用户级 ~/.npmrc，必须显式 --registry 带上镜像，
+    # 否则 root 的 npm 会用官方源（registry.npmjs.org）龟速下载。
+    # --progress 强制显示下载进度条（npm 默认关闭），避免用户以为卡死。
+    #
+    # 输出策略：直接给终端，不经 | tee 管道。
+    # 原因：进度条依赖 TTY，经管道会被 npm 检测为非 TTY 自动禁用；
+    #       且 sudo 密码输入也依赖 TTY，经管道可能无法正常提示。
+    # 日志：此处输出不进 LOG_FILE，但上面 log() 已记录命令本身，足够溯源。
+    log "sudo npm install -g $pkg --registry=$NPM_REGISTRY"
+    if sudo npm install -g "$pkg" --registry="$NPM_REGISTRY" --progress; then
+      printf '\n' >> "$LOG_FILE"   # sudo 输出已实时显示，日志只留分隔
+      ok "$pkg 安装完成（via sudo）"
+      return 0
+    else
+      die "安装 $pkg 失败（即使使用 sudo）"
+    fi
+  else
+    err "已取消 sudo 重试。可手动执行：sudo npm install -g $pkg --registry=$NPM_REGISTRY"
+    die "安装 $pkg 失败（权限不足，未启用 sudo）"
   fi
 }
 
@@ -392,11 +445,10 @@ install_cc_switch_cli() {
     ok "$CCS_CLI_BIN 已安装（$("$CCS_CLI_BIN" --version 2>/dev/null || echo '?')），跳过"
     return 0
   fi
-  log "npm install -g $CCS_CLI_PKG"
-  if npm install -g "$CCS_CLI_PKG" 2>&1 | tee -a "$LOG_FILE"; then
+  # 复用 npm_install_global：自带 EACCES → sudo fallback
+  if npm_install_global "$CCS_CLI_PKG"; then
     ok "cc-switch CLI 版安装完成（命令：$CCS_CLI_BIN）"
   else
-    err "cc-switch CLI 版安装失败"
     return 1
   fi
 }
@@ -898,7 +950,9 @@ version_check() {
   printf '    %s最新版本：%s%s\n' "$c_dim" "${slatest:-查询失败}" "$color_reset"
 
   section "检查完成（未做任何改动，更新请用「更新」菜单/动作）"
-}# ----------------------------- 交互菜单 ------------------------------------
+}
+
+# ----------------------------- 交互菜单 ------------------------------------
 show_menu() {
   printf '\n%s━━ 请选择操作 ━━%s\n\n' "$c_bold" "$color_reset" >&2
   printf '  %s1)%s 安装\n'   "$c_green" "$color_reset" >&2
