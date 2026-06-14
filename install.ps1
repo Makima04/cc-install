@@ -24,8 +24,10 @@
 [CmdletBinding()]
 param(
     [switch]$NonInteractive,   # 等价于 NONINTERACTIVE=1
-    [ArgumentCompleter({ 'install','uninstall','check' })]
-    [string]$Action            # 可选：install / uninstall / check，跳过交互菜单
+    [ArgumentCompleter({ 'install','uninstall','check','update' })]
+    [string]$Action,           # install / uninstall / check / update，跳过交互菜单
+    [ArgumentCompleter({ 'all','claude','codex','ccswitch' })]
+    [string]$Component         # all / claude / codex / ccswitch，默认 all
 )
 
 # 强制用 UTF-8 输出，避免中文乱码（PS5.1 默认 GBK）
@@ -109,6 +111,14 @@ function Resolve-CcSwitchAsset($platformKw, $archKw) {
     return $match.browser_download_url
 }
 
+# 查询 cc-switch 最新 release 版本号（tag_name，如 v1.2.3）
+function Get-CcSwitchLatestVersion {
+    try {
+        $api = "https://api.github.com/repos/$script:CC_SWITCH_REPO/releases/latest"
+        $resp = Invoke-RestMethod -Uri $api -TimeoutSec 20 -Headers @{ 'User-Agent' = 'cc-installer' }
+        return $resp.tag_name
+    } catch { return $null }
+}
 # 通过代理链下载 GitHub 文件
 function Download-GhAsset($ghUrl, $dest) {
     $proxies = $script:GH_PROXIES
@@ -572,60 +582,235 @@ function Invoke-Uninstall {
 "@ | Write-Host
 }
 
+# ----------------------------- 组件操作 ------------------------------------
+# 安装单个组件（comp: all/claude/codex/ccswitch）
+# Node/npm 仅在需要时准备一次；all 模式复用，避免重复检测
+function Install-Component([string]$comp) {
+    if ($comp -eq 'all') {
+        Install-Component 'claude'
+        Install-Component 'codex'
+        Install-Component 'ccswitch'
+        return
+    }
+    # 所有组件当前都依赖 npm（Claude 用 npm，Codex 用 npm，cc-switch MSI/zip 不依赖但保持一致）
+    Ensure-Node
+    Configure-Npm
+    switch ($comp) {
+        'claude'   { Install-NpmGlobal '@anthropic-ai/claude-code' }
+        'codex'    { Install-NpmGlobal '@openai/codex' }
+        'ccswitch' { Install-CcSwitch }
+        default { Die "未知组件：$comp（应为 all/claude/codex/ccswitch）" }
+    }
+}
+
+# 卸载单个组件
+function Uninstall-Component([string]$comp) {
+    if ($comp -eq 'all') {
+        Uninstall-Component 'claude'
+        Uninstall-Component 'codex'
+        Uninstall-Component 'ccswitch'
+        return
+    }
+    switch ($comp) {
+        'claude' {
+            # 按 install-type 分发（原生安装不依赖 npm）
+            $t = Get-ClaudeInstallType
+            switch ($t) {
+                'none'   { Write-Ok 'Claude Code：未安装，跳过' }
+                'native' {
+                    Write-Warn2 '检测到 Claude Code 为原生安装（非 npm），改用文件清理方式'
+                    Uninstall-ClaudeNative
+                }
+                'npm'    { Uninstall-NpmGlobal '@anthropic-ai/claude-code' }
+            }
+        }
+        'codex' {
+            if (Test-Command npm) { Uninstall-NpmGlobal '@openai/codex' }
+            else { Write-Warn2 '未检测到 npm，跳过 Codex 卸载' }
+        }
+        'ccswitch' { Uninstall-CcSwitch }
+        default { Die "未知组件：$comp" }
+    }
+}
+
+# 更新单个组件（混合策略：能调自带 updater 就调，否则重装当前方式）
+# 更新单个组件（全部走国内镜像，不依赖外网）
+# 设计原则：原生安装的更新通道（downloads.claude.ai / claude update）走外网，
+# 国内通常连不上，所以对国内用户：npm 是唯一能稳定走镜像更新的方式。
+function Update-Component([string]$comp) {
+    if ($comp -eq 'all') {
+        Update-Component 'claude'
+        Update-Component 'codex'
+        Update-Component 'ccswitch'
+        return
+    }
+    switch ($comp) {
+        'claude' {
+            $t = Get-ClaudeInstallType
+            if ($t -eq 'none') { Write-Warn2 'Claude Code 未安装，无法更新（请先安装）'; return }
+            if ($t -eq 'native') {
+                # 原生安装的更新走外网（downloads.claude.ai），国内基本连不上。
+                # 提供出路：迁移到 npm 版，之后更新即可走国内镜像。
+                Write-Warn2 '检测到 Claude Code 为原生安装。'
+                Write-Warn2 '原生安装的更新走外网（downloads.claude.ai），国内通常无法访问。'
+                Write-Host  '  → 建议迁移到 npm 版：之后更新即可走国内镜像（npmmirror）。' -ForegroundColor DarkGray
+                if (Confirm-Action '是否迁移到 npm 版（卸载原生 + npm 安装）？') {
+                    Write-Section '迁移 Claude Code：原生 → npm'
+                    Uninstall-ClaudeNative
+                    Ensure-Node; Configure-Npm
+                    Install-NpmGlobal '@anthropic-ai/claude-code@latest'
+                    Write-Ok '已迁移到 npm 版，后续更新可走国内镜像'
+                } else {
+                    Write-Warn2 '已跳过。如需更新，可手动挂代理后执行 claude update，或重新运行本命令选择迁移。'
+                }
+            } else {
+                # npm 安装：重装 @latest（走 npmmirror）
+                Write-Section '更新 Claude Code（npm：重装 @latest，走国内镜像）'
+                Ensure-Node; Configure-Npm
+                Install-NpmGlobal '@anthropic-ai/claude-code@latest'
+            }
+        }
+        'codex' {
+            if (-not (Test-Command codex)) { Write-Warn2 'Codex CLI 未安装，无法更新（请先安装）'; return }
+            # codex update 同样走外网，国内用户直接走 npm 重装最稳
+            Write-Section '更新 Codex CLI（npm 重装 @latest，走国内镜像）'
+            Ensure-Node; Configure-Npm
+            Install-NpmGlobal '@openai/codex@latest'
+        }
+        'ccswitch' {
+            if (-not (Test-CcSwitchInstalled)) { Write-Warn2 'cc-switch 未安装，无法更新（请先安装）'; return }
+            # 桌面版无 CLI updater：卸载后重下最新 release（走 GitHub 代理链）
+            Write-Section '更新 cc-switch（卸载 + 重下最新 release）'
+            Uninstall-CcSwitch
+            Install-CcSwitch
+        }
+        default { Die "未知组件：$comp" }
+    }
+}
+# ----------------------------- 版本检查 ------------------------------------
+# 取 npm 包最新版本（走已配置的 npmmirror）
+function Get-NpmLatestVersion([string]$pkg) {
+    try {
+        $v = (& npm view $pkg version 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $v) { return $v.Trim() }
+    } catch { }
+    return $null
+}
+
+# 取本机 claude 版本字符串
+function Get-ClaudeLocalVersion {
+    if (-not (Test-Command claude)) { return $null }
+    return (claude --version 2>&1 | Select-Object -First 1)
+}
+function Get-CodexLocalVersion {
+    if (-not (Test-Command codex)) { return $null }
+    return (codex --version 2>&1 | Select-Object -First 1)
+}
+
+# 综合检查：本地状态 + 本地版本 + 远程最新 + 是否有更新
+function Invoke-VersionCheck {
+    Detect-Env
+    Write-Section '组件状态与版本'
+
+    # Claude Code
+    $cv = Get-ClaudeLocalVersion
+    if ($cv) {
+        $ct = Get-ClaudeInstallType
+        $clabel = switch ($ct) { 'native' { ' [原生安装]' } 'npm' { ' [npm]' } default { '' } }
+        Write-Ok "Claude Code：$cv$clabel"
+    } else { Write-Warn2 'Claude Code：未安装' }
+    $clatest = Get-NpmLatestVersion '@anthropic-ai/claude-code'
+    Write-Host  "    最新版本：$(if($clatest){$clatest}else{'查询失败'})" -ForegroundColor DarkGray
+
+    # Codex CLI
+    $dv = Get-CodexLocalVersion
+    if ($dv) { Write-Ok "Codex CLI：$dv" } else { Write-Warn2 'Codex CLI：未安装' }
+    $dlatest = Get-NpmLatestVersion '@openai/codex'
+    Write-Host  "    最新版本：$(if($dlatest){$dlatest}else{'查询失败'})" -ForegroundColor DarkGray
+
+    # cc-switch（桌面版无命令行版本输出，仅报告是否已装 + 最新 release tag）
+    if (Test-CcSwitchInstalled) { Write-Ok 'cc-switch 桌面版：已安装' }
+    else { Write-Warn2 'cc-switch 桌面版：未安装' }
+    $slatest = Get-CcSwitchLatestVersion
+    Write-Host  "    最新版本：$(if($slatest){$slatest}else{'查询失败'})" -ForegroundColor DarkGray
+
+    Write-Section '检查完成（未做任何改动，更新请用「更新」菜单/动作）'
+}
+
 # ----------------------------- 交互菜单 ------------------------------------
 function Show-Menu {
     Write-Host ""
     Write-Host "━━ 请选择操作 ━━" -ForegroundColor White
-    Write-Host "  1) 安装 Claude Code + Codex + cc-switch" -ForegroundColor Green
-    Write-Host "  2) 卸载（还原可用的初始状态）"           -ForegroundColor Red
-    Write-Host "  3) 仅检查环境（不做任何改动）"           -ForegroundColor DarkGray
-    Write-Host "  q) 退出`n"                                -ForegroundColor DarkGray
+    Write-Host "  1) 安装"   -ForegroundColor Green
+    Write-Host "  2) 卸载"   -ForegroundColor Red
+    Write-Host "  3) 检查（状态 + 版本，含远程最新版）" -ForegroundColor DarkGray
+    Write-Host "  4) 更新"   -ForegroundColor Cyan
+    Write-Host "  q) 退出
+" -ForegroundColor DarkGray
 }
 
-# 返回动作：install / uninstall / check / exit
-function Resolve-Action {
-    param([string]$Arg)
-    switch -Regex ($Arg) {
-        '^(install|uninstall|check)$' { return $Arg }
-        '^$' { }                      # 落到交互
-        '.'  {
-            Write-Err2 "未知参数：$Arg"
-            Write-Err2 '用法：.\install.ps1 [install|uninstall|check]'
-            exit 2
-        }
-    }
-    if ($NonInteractive) { return 'install' }
-
+# 二级菜单：选组件。返回 all/claude/codex/ccswitch/back
+function Show-ComponentMenu([string]$action) {
+    $cn = @{ install = '安装'; uninstall = '卸载'; update = '更新' }
+    $verb = $cn[$action]
+    Write-Host ""
+    Write-Host "━━ 选择要$verb的组件 ━━" -ForegroundColor White
+    Write-Host "  1) 全部（Claude Code + Codex + cc-switch）" -ForegroundColor White
+    Write-Host "  2) Claude Code"   -ForegroundColor Green
+    Write-Host "  3) Codex CLI"     -ForegroundColor Green
+    Write-Host "  4) cc-switch"     -ForegroundColor Green
+    Write-Host "  b) 返回上级
+"    -ForegroundColor DarkGray
     while ($true) {
-        Show-Menu
-        $choice = Read-Host '请输入选项 [1-3/q]'
-        switch -Regex ($choice) {
-            '^(1|i|install)$'    { return 'install' }
-            '^(2|u|uninstall)$'  { return 'uninstall' }
-            '^(3|c|check)$'      { return 'check' }
-            '^(q|quit|exit)$'    { return 'exit' }
+        $c = Read-Host '请输入选项 [1-4/b]'
+        switch -Regex ($c) {
+            '^(1|a|all)$'      { return 'all' }
+            '^(2|claude)$'     { return 'claude' }
+            '^(3|codex)$'      { return 'codex' }
+            '^(4|cc|ccswitch)$' { return 'ccswitch' }
+            '^(b|back|返回)$'  { return 'back' }
             default { Write-Warn2 '无效输入，请重选' }
         }
     }
 }
 
-# 仅检查环境，不改动
-function Invoke-CheckOnly {
-    Detect-Env
-    Write-Section '当前已安装'
-    if (Test-Command node)   { Write-Ok "Node.js $(node -v)" }       else { Write-Warn2 'Node.js：未安装' }
-    if (Test-Command claude) {
-        $cver = (claude --version 2>&1 | Select-Object -First 1)
-        $ctype = Get-ClaudeInstallType
-        $clabel = switch ($ctype) { 'native' { ' [原生安装]' } 'npm' { ' [npm]' } default { '' } }
-        Write-Ok "Claude Code：$cver$clabel"
+# 解析动作 + 组件（来自 param 或交互）。返回哈希：@{ Action=...; Component=... }
+# Action: install/uninstall/check/update/exit
+function Resolve-Action {
+    param([string]$ActionArg, [string]$ComponentArg)
+    # 1) 命令行直接给定了 Action
+    switch -Regex ($ActionArg) {
+        '^(install|uninstall|update)$' {
+            $comp = if ($ComponentArg) { $ComponentArg } else { 'all' }
+            return @{ Action = $ActionArg; Component = $comp }
+        }
+        '^check$' { return @{ Action = 'check'; Component = 'all' } }
+        '^$' { }   # 落到交互
+        '.'  {
+            Write-Err2 "未知动作：$ActionArg"
+            Write-Err2 '用法：.\install.ps1 [-Action install|uninstall|check|update] [-Component all|claude|codex|ccswitch]'
+            exit 2
+        }
     }
-    else { Write-Warn2 'Claude Code：未安装' }
-    if (Test-Command codex)  { Write-Ok "Codex CLI：$(codex --version 2>&1 | Select-Object -First 1)" }
-    else { Write-Warn2 'Codex CLI：未安装' }
-    if (Test-CcSwitchInstalled) { Write-Ok 'cc-switch 桌面版：已安装' }
-    else { Write-Warn2 'cc-switch 桌面版：未安装' }
-    Write-Section '检查完成（未做任何改动）'
+    if ($NonInteractive) { return @{ Action = 'install'; Component = 'all' } }
+
+    # 2) 交互主菜单
+    while ($true) {
+        Show-Menu
+        $choice = Read-Host '请输入选项 [1-4/q]'
+        switch -Regex ($choice) {
+            '^(1|i|install)$'    { $act = 'install';   break }
+            '^(2|u|uninstall)$'  { $act = 'uninstall'; break }
+            '^(3|c|check)$'      { return @{ Action = 'check'; Component = 'all' } }
+            '^(4|update)$'       { $act = 'update';    break }
+            '^(q|quit|exit)$'    { return @{ Action = 'exit'; Component = 'all' } }
+            default { Write-Warn2 '无效输入，请重选'; continue }
+        }
+        # 二级菜单选组件
+        $comp = Show-ComponentMenu $act
+        if ($comp -eq 'back') { continue }
+        return @{ Action = $act; Component = $comp }
+    }
 }
 
 # ----------------------------- 主流程 --------------------------------------
@@ -637,31 +822,36 @@ function Main {
     Write-Host "Claude Code + Codex + cc-switch 管理工具（国内镜像）v$($script:VERSION)" -ForegroundColor White
     Write-Host "全程使用国内镜像，无需梯子" -ForegroundColor DarkGray
 
-    # $Action 来自脚本 param 块；未传时为空串，Resolve-Action 会进入交互菜单
-    $action = Resolve-Action -Arg $Action
+    $resolved = Resolve-Action -ActionArg $Action -ComponentArg $Component
+    $action = $resolved.Action
+    $comp   = $resolved.Component
 
     switch ($action) {
         'exit' { Write-Ok '已退出'; exit 0 }
-        'check' { Invoke-CheckOnly; exit 0 }
+        'check' { Invoke-VersionCheck; exit 0 }
         'uninstall' {
             Detect-Env
-            Invoke-Uninstall
+            Uninstall-Component $comp
             Write-Section '完成 🎉'
             Write-Ok "卸载流程结束。日志：$script:LOG_FILE"
+            return
+        }
+        'update' {
+            Detect-Env
+            Update-Component $comp
+            Write-Section '完成 🎉'
+            Write-Ok "更新流程结束。日志：$script:LOG_FILE"
             return
         }
     }
 
     # install
     Detect-Env
-    Ensure-Node
-    Configure-Npm
-    Install-NpmGlobal '@anthropic-ai/claude-code'
-    Install-NpmGlobal '@openai/codex'
-    Install-CcSwitch
-    if (-not (Invoke-Verify)) { Write-Warn2 '部分组件校验未通过，请查看上方提示' }
-    Print-NextSteps
-
+    Install-Component $comp
+    if ($comp -eq 'all') {
+        if (-not (Invoke-Verify)) { Write-Warn2 '部分组件校验未通过，请查看上方提示' }
+        Print-NextSteps
+    }
     Write-Section '完成 🎉'
     Write-Ok "安装流程结束。如有问题，附上日志反馈：$script:LOG_FILE"
 }

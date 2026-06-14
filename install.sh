@@ -126,6 +126,13 @@ resolve_cc_switch_asset() {
   echo "$url"
 }
 
+# 查询 cc-switch 最新 release 版本号（tag_name，如 v1.2.3）
+cc_switch_latest_version() {
+  local api_url="https://api.github.com/repos/${CC_SWITCH_REPO}/releases/latest"
+  local json
+  json=$(curl -fsSL --max-time 20 "$api_url" 2>/dev/null) || return 1
+  printf '%s\n' "$json" | grep -o '"tag_name": *"[^"]*"' | sed 's/.*: *"//; s/"$//'
+}
 # 通过代理链下载 GitHub 文件；用户可用 GH_PROXY 覆盖
 # 用法：gh_download "<github下载url>" "<本地保存路径>"
 gh_download() {
@@ -752,52 +759,122 @@ EOF
   remove_nvm_node
 }
 
-# ----------------------------- 交互菜单 ------------------------------------
-show_menu() {
-  # 菜单输出到 stderr，避免被 $(resolve_action) 捕获污染返回值
-  printf '\n%s━━ 请选择操作 ━━%s\n\n' "$c_bold" "$color_reset" >&2
-  printf '  %s1)%s 安装 Claude Code + Codex + cc-switch\n' "$c_green" "$color_reset" >&2
-  printf '  %s2)%s 卸载（还原可用的初始状态）\n'     "$c_red"   "$color_reset" >&2
-  printf '  %s3)%s 仅检查环境（不做任何改动）\n'     "$c_dim"   "$color_reset" >&2
-  printf '  %sq)%s 退出\n\n'                          "$c_dim"   "$color_reset" >&2
-}
-
-# 解析命令行参数 / 交互输入，返回动作：install / uninstall / check / exit
-resolve_action() {
-  case "${1:-}" in
-    install|uninstall|check) echo "$1"; return 0 ;;
-    "") : ;;  # 落到交互
-    *)
-      err "未知参数：$1"
-      err "用法：bash install.sh [install|uninstall|check]"
-      exit 2
-      ;;
-  esac
-
-  if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
-    echo "install"
-    return 0
+# ----------------------------- 组件操作 ------------------------------------
+install_component() {
+  local comp="$1"
+  if [[ "$comp" == "all" ]]; then
+    install_component claude
+    install_component codex
+    install_component ccswitch
+    return
   fi
-
-  local choice
-  while true; do
-    show_menu
-    read -r -p "$(printf '%s请输入选项 [1-3/q]: %s' "$c_yellow" "$color_reset")" choice >&2 || { echo "exit"; return 0; }
-    case "$choice" in
-      1|i|install)   echo "install";   return 0 ;;
-      2|u|uninstall) echo "uninstall"; return 0 ;;
-      3|c|check)     echo "check";     return 0 ;;
-      q|quit|exit)   echo "exit";      return 0 ;;
-      *) warn "无效输入，请重选" ;;
-    esac
-  done
+  ensure_node
+  configure_npm
+  case "$comp" in
+    claude)   npm_install_global "@anthropic-ai/claude-code" ;;
+    codex)    npm_install_global "@openai/codex" ;;
+    ccswitch) install_cc_switch ;;
+    *) err "未知组件：$comp（应为 all/claude/codex/ccswitch）"; exit 1 ;;
+  esac
 }
 
-# 仅检查环境，不改动
-run_check_only() {
+uninstall_component() {
+  local comp="$1"
+  if [[ "$comp" == "all" ]]; then
+    # 全量卸载复用现有 uninstall()：含 claude/codex/cc-switch + restore_npmrc + Node 提示
+    uninstall
+    return
+  fi
+  case "$comp" in
+    claude)
+      local t
+      t="$(claude_install_type)"
+      case "$t" in
+        none)   ok "Claude Code：未安装，跳过" ;;
+        native)
+          warn "检测到 Claude Code 为原生安装（非 npm），改用文件清理方式"
+          uninstall_claude_native
+          ;;
+        npm)    npm_uninstall_global "@anthropic-ai/claude-code" ;;
+      esac
+      ;;
+    codex)
+      if have npm; then npm_uninstall_global "@openai/codex"
+      else warn "未检测到 npm，跳过 Codex 卸载"; fi
+      ;;
+    ccswitch)
+      case "$OS_KIND" in
+        macos) uninstall_cc_switch_macos ;;
+        linux) uninstall_cc_switch_linux ;;
+      esac
+      ;;
+    *) err "未知组件：$comp"; exit 1 ;;
+  esac
+}
+
+# 更新单个组件（全部走国内镜像，不依赖外网）
+update_component() {
+  local comp="$1"
+  if [[ "$comp" == "all" ]]; then
+    update_component claude
+    update_component codex
+    update_component ccswitch
+    return
+  fi
+  case "$comp" in
+    claude)
+      local t
+      t="$(claude_install_type)"
+      if [[ "$t" == "none" ]]; then warn "Claude Code 未安装，无法更新（请先安装）"; return; fi
+      if [[ "$t" == "native" ]]; then
+        warn "检测到 Claude Code 为原生安装。"
+        warn "原生安装的更新走外网（downloads.claude.ai），国内通常无法访问。"
+        printf '  %s→ 建议迁移到 npm 版：之后更新即可走国内镜像（npmmirror）。%s\n' "$c_dim" "$color_reset"
+        if confirm "是否迁移到 npm 版（卸载原生 + npm 安装）？"; then
+          section "迁移 Claude Code：原生 → npm"
+          uninstall_claude_native
+          ensure_node; configure_npm
+          npm_install_global "@anthropic-ai/claude-code@latest"
+          ok "已迁移到 npm 版，后续更新可走国内镜像"
+        else
+          warn "已跳过。如需更新，可手动挂代理后执行 claude update，或重新运行本命令选择迁移。"
+        fi
+      else
+        section "更新 Claude Code（npm：重装 @latest，走国内镜像）"
+        ensure_node; configure_npm
+        npm_install_global "@anthropic-ai/claude-code@latest"
+      fi
+      ;;
+    codex)
+      if ! have codex; then warn "Codex CLI 未安装，无法更新（请先安装）"; return; fi
+      section "更新 Codex CLI（npm 重装 @latest，走国内镜像）"
+      ensure_node; configure_npm
+      npm_install_global "@openai/codex@latest"
+      ;;
+    ccswitch)
+      if ! cc_switch_already_installed; then warn "cc-switch 未安装，无法更新（请先安装）"; return; fi
+      section "更新 cc-switch（卸载 + 重下最新 release）"
+      case "$OS_KIND" in
+        macos) uninstall_cc_switch_macos ;;
+        linux) uninstall_cc_switch_linux ;;
+      esac
+      install_cc_switch
+      ;;
+    *) err "未知组件：$comp"; exit 1 ;;
+  esac
+}
+
+# ----------------------------- 版本检查 ------------------------------------
+npm_latest_version() {
+  local pkg="$1" v
+  v=$(npm view "$pkg" version 2>/dev/null) || return 1
+  [[ -n "$v" ]] && printf '%s' "$v"
+}
+
+version_check() {
   detect_env
-  section "当前已安装"
-  if have node; then ok "Node.js $(node -v)"; else warn "Node.js：未安装"; fi
+  section "组件状态与版本"
+
   if have claude; then
     local cver ctype clabel
     cver="$(claude --version 2>&1 | head -1)"
@@ -805,50 +882,135 @@ run_check_only() {
     case "$ctype" in native) clabel=" [原生安装]";; npm) clabel=" [npm]";; *) clabel="";; esac
     ok "Claude Code：$cver$clabel"
   else warn "Claude Code：未安装"; fi
+  local clatest
+  clatest="$(npm_latest_version '@anthropic-ai/claude-code')" || clatest=""
+  printf '    %s最新版本：%s%s\n' "$c_dim" "${clatest:-查询失败}" "$color_reset"
+
   if have codex; then ok "Codex CLI：$(codex --version 2>&1 | head -1)"; else warn "Codex CLI：未安装"; fi
-  if cc_switch_already_installed; then ok "cc-switch：已安装（$(cc_switch_mode_label)）"; else warn "cc-switch $(cc_switch_mode_label)：未安装"; fi
-  section "检查完成（未做任何改动）"
+  local dlatest
+  dlatest="$(npm_latest_version '@openai/codex')" || dlatest=""
+  printf '    %s最新版本：%s%s\n' "$c_dim" "${dlatest:-查询失败}" "$color_reset"
+
+  if cc_switch_already_installed; then ok "cc-switch：已安装（$(cc_switch_mode_label)）"
+  else warn "cc-switch $(cc_switch_mode_label)：未安装"; fi
+  local slatest
+  slatest="$(cc_switch_latest_version)" || slatest=""
+  printf '    %s最新版本：%s%s\n' "$c_dim" "${slatest:-查询失败}" "$color_reset"
+
+  section "检查完成（未做任何改动，更新请用「更新」菜单/动作）"
+}# ----------------------------- 交互菜单 ------------------------------------
+show_menu() {
+  printf '\n%s━━ 请选择操作 ━━%s\n\n' "$c_bold" "$color_reset" >&2
+  printf '  %s1)%s 安装\n'   "$c_green" "$color_reset" >&2
+  printf '  %s2)%s 卸载\n'   "$c_red"   "$color_reset" >&2
+  printf '  %s3)%s 检查（状态 + 版本，含远程最新版）\n' "$c_dim" "$color_reset" >&2
+  printf '  %s4)%s 更新\n'   "$c_blue"  "$color_reset" >&2
+  printf '  %sq)%s 退出\n\n' "$c_dim"   "$color_reset" >&2
+}
+
+# 二级菜单：选组件。输出 all/claude/codex/ccswitch/back
+show_component_menu() {
+  local action="$1" verb
+  case "$action" in install) verb="安装";; uninstall) verb="卸载";; update) verb="更新";; *) verb="$action";; esac
+  printf '\n%s━━ 选择要%s的组件 ━━%s\n\n' "$c_bold" "$verb" "$color_reset" >&2
+  printf '  1) 全部（Claude Code + Codex + cc-switch）\n' >&2
+  printf '  %s2)%s Claude Code\n'   "$c_green" "$color_reset" >&2
+  printf '  %s3)%s Codex CLI\n'     "$c_green" "$color_reset" >&2
+  printf '  %s4)%s cc-switch\n'     "$c_green" "$color_reset" >&2
+  printf '  %sb)%s 返回上级\n\n'    "$c_dim"   "$color_reset" >&2
+  local c
+  while true; do
+    read -r -p "$(printf '%s请输入选项 [1-4/b]: %s' "$c_yellow" "$color_reset")" c >&2 || { echo "back"; return 0; }
+    case "$c" in
+      1|a|all)      echo "all"; return 0 ;;
+      2|claude)     echo "claude"; return 0 ;;
+      3|codex)      echo "codex"; return 0 ;;
+      4|cc|ccswitch) echo "ccswitch"; return 0 ;;
+      b|back|返回)  echo "back"; return 0 ;;
+      *) warn "无效输入，请重选" ;;
+    esac
+  done
+}
+
+# 解析动作+组件，输出 "ACTION COMPONENT"（空格分隔）
+resolve_action() {
+  local act="${1:-}" comp="${2:-}"
+  case "$act" in
+    install|uninstall|update)
+      [[ -z "$comp" ]] && comp="all"
+      printf '%s %s\n' "$act" "$comp"; return 0 ;;
+    check)
+      printf 'check all\n'; return 0 ;;
+    "")
+      : ;;
+    *)
+      err "未知动作：$act"
+      err "用法：bash install.sh [install|uninstall|check|update] [all|claude|codex|ccswitch]"
+      exit 2 ;;
+  esac
+
+  if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then printf 'install all\n'; return 0; fi
+
+  local choice
+  while true; do
+    show_menu
+    read -r -p "$(printf '%s请输入选项 [1-4/q]: %s' "$c_yellow" "$color_reset")" choice >&2 || { printf 'exit all\n'; return 0; }
+    case "$choice" in
+      1|i|install)    act="install" ;;
+      2|u|uninstall)  act="uninstall" ;;
+      3|c|check)      printf 'check all\n'; return 0 ;;
+      4|update)       act="update" ;;
+      q|quit|exit)    printf 'exit all\n'; return 0 ;;
+      *) warn "无效输入，请重选"; continue ;;
+    esac
+    local comp
+    comp=$(show_component_menu "$act")
+    if [[ "$comp" == "back" ]]; then continue; fi
+    printf '%s %s\n' "$act" "$comp"; return 0
+  done
 }
 
 # ----------------------------- 主流程 --------------------------------------
 main() {
-  # 准备日志
   mkdir -p "$LOG_DIR"
-  : > "$LOG_FILE"   # 每次重置（如需保留可改追加）
+  : > "$LOG_FILE"
   echo "[install.sh v$VERSION] $(date)" | tee -a "$LOG_FILE"
 
   printf '%s\n' "${c_bold}Claude Code + Codex + cc-switch 管理工具（国内镜像）v$VERSION${color_reset}"
   printf '%s\n' "${c_dim}全程使用国内镜像，无需梯子${color_reset}"
 
-  local action
-  action=$(resolve_action "${1:-}")
+  local resolved action comp
+  resolved=$(resolve_action "${1:-}" "${2:-}")
+  action="${resolved%% *}"
+  comp="${resolved##* }"
+
   case "$action" in
     exit)  ok "已退出"; exit 0 ;;
-    check)
-      run_check_only
-      exit 0
+    check) version_check; exit 0 ;;
+  esac
+
+  detect_env
+
+  case "$action" in
+    uninstall)
+      uninstall_component "$comp"
+      section "完成 🎉"
+      ok "卸载流程结束。日志：$LOG_FILE"
+      return
+      ;;
+    update)
+      update_component "$comp"
+      section "完成 🎉"
+      ok "更新流程结束。日志：$LOG_FILE"
+      return
       ;;
   esac
 
-  # install / uninstall 都需要先检测环境
-  detect_env
-
-  if [[ "$action" == "uninstall" ]]; then
-    uninstall
-    section "完成 🎉"
-    ok "卸载流程结束。日志：$LOG_FILE"
-    return
+  install_component "$comp"
+  if [[ "$comp" == "all" ]]; then
+    verify || warn "部分组件校验未通过，请查看上方提示"
+    print_next_steps
   fi
-
-  # install
-  ensure_node
-  configure_npm
-  npm_install_global "@anthropic-ai/claude-code"
-  npm_install_global "@openai/codex"
-  install_cc_switch
-  verify || warn "部分组件校验未通过，请查看上方提示"
-  print_next_steps
-
   section "完成 🎉"
   ok "安装流程结束。如有问题，附上日志反馈：$LOG_FILE"
 }
