@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志（脚本运行时生成）
+*.log
+.cc-installer/
+
+# 临时文件
+*.tmp
+*.bak
