@@ -4,7 +4,7 @@
 .DESCRIPTION
     全程走国内镜像，无需梯子。运行时 API 走国内 LLM 厂商官方接口。
 .NOTES
-    版本：1.0.0
+    版本：1.1.0
     要求：Windows 10/11，PowerShell 5.1+（或 PowerShell 7+）
 .EXAMPLE
     # 一行命令（推荐）
@@ -35,7 +35,7 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 # ----------------------------- 常量 ----------------------------------------
-$script:VERSION               = '1.0.0'
+$script:VERSION               = '1.1.0'
 $script:REQUIRED_NODE_MAJOR   = 22
 $script:CC_SWITCH_REPO        = 'farion1231/cc-switch'
 
@@ -89,35 +89,64 @@ function Confirm-Action($prompt) {
     return $reply -match '^[Yy]'
 }
 
-# 通过 GitHub API 拿最新 release 中匹配的 asset 下载地址
-function Resolve-CcSwitchAsset($platformKw, $archKw) {
-    $api = "https://api.github.com/repos/$script:CC_SWITCH_REPO/releases/latest"
-    try {
-        $resp = Invoke-RestMethod -Uri $api -TimeoutSec 30 -Headers @{ 'User-Agent' = 'cc-installer' }
-    } catch {
-        Die "无法访问 GitHub API：$api`n$_"
+# 查询 cc-switch 最新 release 版本号（走代理链 + 重定向，不依赖 API，规避限流）
+# 思路：GitHub 对 /releases/latest 返回 302，Location 末段即 tag（如 v3.16.2）。
+#       代理（ghfast.top 等）能转发该重定向，但无法转发 api.github.com（403），
+#       所以这里坚决不碰 API。
+function Get-CcSwitchLatestTag {
+    $proxies = $script:GH_PROXIES
+    if ($env:GH_PROXY) {
+        $custom = $env:GH_PROXY.TrimEnd('/') + '/'
+        $proxies = @($custom, '')
     }
-    # assets 里 browser_download_url 同时匹配平台/架构关键词（不区分大小写）
-    $match = $resp.assets | Where-Object {
-        $_.browser_download_url -match $platformKw -and $_.browser_download_url -match $archKw
-    } | Select-Object -First 1
-
-    if (-not $match) {
-        Write-Err2 "在最新 release 中未找到匹配的 cc-switch 安装包"
-        Write-Err2 "  platform=$platformKw arch=$archKw"
-        Write-Err2 "  请到 https://github.com/$script:CC_SWITCH_REPO/releases 手动下载"
-        exit 1
+    $releaseUrl = "https://github.com/$script:CC_SWITCH_REPO/releases/latest"
+    foreach ($p in $proxies) {
+        $full = "$p$releaseUrl"
+        Write-Log "查询最新版本（跟随重定向）：$full"
+        try {
+            $resp = Invoke-WebRequest -Uri $full -UseBasicParsing -TimeoutSec 30
+            # 落地 URL 末段即 tag；兼容 PS5.1（ResponseUri）与 PS7（RequestMessage.RequestUri）
+            $finalUri = $null
+            if ($resp.BaseResponse.ResponseUri) {
+                $finalUri = $resp.BaseResponse.ResponseUri.AbsoluteUri
+            } elseif ($resp.BaseResponse.RequestMessage.RequestUri) {
+                $finalUri = $resp.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
+            }
+            if ($finalUri -and $finalUri -match '/(v\d+\.\d+\.\d+)/?$') {
+                Write-Log "最新版本：$($Matches[1])"
+                return $Matches[1]
+            }
+        } catch {
+            Write-Warn2 "此源失败，切换下一个..."
+        }
     }
-    return $match.browser_download_url
+    return $null
 }
 
-# 查询 cc-switch 最新 release 版本号（tag_name，如 v1.2.3）
-function Get-CcSwitchLatestVersion {
-    try {
-        $api = "https://api.github.com/repos/$script:CC_SWITCH_REPO/releases/latest"
-        $resp = Invoke-RestMethod -Uri $api -TimeoutSec 20 -Headers @{ 'User-Agent' = 'cc-installer' }
-        return $resp.tag_name
-    } catch { return $null }
+# 用「tag + 命名规则」拼出当前平台对应的 cc-switch 安装包下载地址（不调 API，规避限流）
+# 命名规则（v3.x 实测）：CC-Switch-{tag}-{Platform}[.ext]
+#   Windows: CC-Switch-v3.16.2-Windows.msi（不分架构）
+#   macOS  : CC-Switch-v3.16.2-macOS.dmg
+#   Linux  : CC-Switch-v3.16.2-Linux-{x86_64|arm64}.AppImage
+function Resolve-CcSwitchAsset {
+    $tag = Get-CcSwitchLatestTag
+    if (-not $tag) {
+        Write-Err2 "无法获取 cc-switch 最新版本（GitHub API 限流，且所有代理/直连均失败）"
+        Write-Err2 "  请稍后重试，或手动到 https://github.com/$script:CC_SWITCH_REPO/releases 下载"
+        exit 1
+    }
+    $fname = switch ($script:OS_KIND) {
+        'windows' { "CC-Switch-$tag-Windows.msi" }
+        'macos'   { "CC-Switch-$tag-macOS.dmg" }
+        'linux'   {
+            if ($script:ARCH -eq 'arm64') { "CC-Switch-$tag-Linux-arm64.AppImage" }
+            else { "CC-Switch-$tag-Linux-x86_64.AppImage" }
+        }
+        default { Die "不支持的平台：$script:OS_KIND" }
+    }
+    $url = "https://github.com/$script:CC_SWITCH_REPO/releases/download/$tag/$fname"
+    Write-Log "cc-switch 安装包：$url"
+    return $url
 }
 # 通过代理链下载 GitHub 文件
 function Download-GhAsset($ghUrl, $dest) {
@@ -281,67 +310,35 @@ function Test-CcSwitchInstalled {
     return $false
 }
 
-function Install-CcSwitch {
-    Write-Section '安装 cc-switch 桌面版'
+# 仅下载 cc-switch 安装包到「下载」文件夹，不自动安装
+# 设计动机：
+#   1) 原方案静默 MSI 安装需 UAC 提权，失败点多；改由用户双击自行安装更可控。
+#   2) 全程走 GitHub 代理链下载，不调 API（规避限流）。
+function Download-CcSwitch {
+    Write-Section '下载 cc-switch 安装包'
 
-    if (Test-CcSwitchInstalled) {
-        Write-Ok 'cc-switch 已安装，跳过'
+    $downloads = Join-Path $env:USERPROFILE 'Downloads'
+    if (-not (Test-Path $downloads)) {
+        New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+    }
+
+    $url   = Resolve-CcSwitchAsset
+    $fname = Split-Path $url -Leaf
+    $dest  = Join-Path $downloads $fname
+
+    # 已下载且非空 → 跳过（幂等）
+    if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 0) {
+        $size = [math]::Round((Get-Item $dest).Length / 1MB, 1)
+        Write-Ok "已存在同名文件，跳过下载：$dest（${size} MB）"
+        Write-Host  '  → 双击该文件即可安装 cc-switch（MSI 安装可能弹出 UAC）' -ForegroundColor DarkGray
         return
     }
 
-    # Windows：匹配 .msi（首选）或 portable .zip
-    $archKw = if ($script:ARCH -eq 'arm64') { '(arm64|aarch64)' } else { '(x64|amd64|x86_64)?' }
-    $url = Resolve-CcSwitchAsset '(win|windows)' "$archKw.*\.(msi|zip)"
+    Download-GhAsset $url $dest
 
-    if ($url -match '\.msi$') {
-        Install-CcSwitchMsi $url
-    } elseif ($url -match '\.zip$') {
-        Install-CcSwitchPortable $url
-    } else {
-        Die "无法识别 cc-switch 安装包格式：$url"
-    }
-}
-
-function Install-CcSwitchMsi($url) {
-    $msi = Join-Path $env:TEMP 'cc-switch.msi'
-    Download-GhAsset $url $msi
-
-    Write-Log '静默安装 cc-switch MSI（可能弹出 UAC）...'
-    $args = @('/i', "`"$msi`"", '/qb', '/norestart')
-    $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $args -Wait -PassThru -Verb RunAs
-    Remove-Item $msi -Force -ErrorAction SilentlyContinue
-
-    if ($proc.ExitCode -ne 0) {
-        Die "cc-switch MSI 安装失败（退出码 $($proc.ExitCode)）"
-    }
-    Write-Ok 'cc-switch 安装完成'
-}
-
-function Install-CcSwitchPortable($url) {
-    $zip = Join-Path $env:TEMP 'cc-switch.zip'
-    Download-GhAsset $url $zip
-
-    $dest = Join-Path $env:LOCALAPPDATA 'Programs\cc-switch'
-    New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    Expand-Archive -Path $zip -DestinationPath $dest -Force
-    Remove-Item $zip -Force -ErrorAction SilentlyContinue
-
-    # 尝试创建桌面快捷方式
-    $exe = Get-ChildItem $dest -Filter 'cc-switch.exe' -Recurse | Select-Object -First 1
-    if ($exe) {
-        $shortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CC Switch.lnk'
-        try {
-            $shell = New-Object -ComObject WScript.Shell
-            $s = $shell.CreateShortcut($shortcut)
-            $s.TargetPath = $exe.FullName
-            $s.Save()
-            Write-Ok "已解压并创建桌面快捷方式：$shortcut"
-        } catch {
-            Write-Ok "已解压到 $dest"
-        }
-    } else {
-        Write-Ok "已解压到 $dest"
-    }
+    $size = [math]::Round((Get-Item $dest).Length / 1MB, 1)
+    Write-Ok "下载完成：$dest（${size} MB）"
+    Write-Host  '  → 双击该文件即可安装 cc-switch（MSI 安装可能弹出 UAC）' -ForegroundColor DarkGray
 }
 
 # ----------------------------- 校验 ----------------------------------------
@@ -368,7 +365,8 @@ function Invoke-Verify {
     if (Test-CcSwitchInstalled) {
         Write-Ok 'cc-switch 桌面版：已安装'
     } else {
-        Write-Warn2 'cc-switch 未检测到（可能需要手动确认安装位置）'
+        # cc-switch 由用户手动安装：未检测到不算失败，仅提示去「下载」文件夹双击安装包
+        Write-Warn2 'cc-switch 桌面版：未检测到（安装包已下载到「下载」文件夹，请双击安装）'
     }
     return $allOk
 }
@@ -378,8 +376,9 @@ function Print-NextSteps {
     Write-Section '下一步：配置国内 LLM API'
     @"
 
-1. 启动 cc-switch
-   从开始菜单搜 "CC Switch" 或双击桌面快捷方式
+1. 安装并启动 cc-switch
+   打开「下载」文件夹，双击 CC-Switch-*.msi 安装；
+   之后从开始菜单搜 "CC Switch" 启动
 
 2. 获取国内 LLM 的 API Key（任选其一，均无需梯子）：
    • 智谱 GLM      https://open.bigmodel.cn/          (推荐 GLM-4.6)
@@ -485,7 +484,7 @@ function Uninstall-ClaudeNative {
         }
     }
 
-    # 4) PATH 不自动改：~/.local/bin 可能被其他工具共用（如本脚本的 cc-switch portable）
+    # 4) PATH 不自动改：~/.local/bin 可能被其他工具共用
     #    仅在日志里提示，用户可按需手动从用户 PATH 移除 ~/.local/bin
     Write-Log '提示：~/.local/bin 未从 PATH 移除（可能被其他工具共用），如需可手动清理'
 
@@ -592,13 +591,11 @@ function Install-Component([string]$comp) {
         Install-Component 'ccswitch'
         return
     }
-    # 所有组件当前都依赖 npm（Claude 用 npm，Codex 用 npm，cc-switch MSI/zip 不依赖但保持一致）
-    Ensure-Node
-    Configure-Npm
     switch ($comp) {
-        'claude'   { Install-NpmGlobal '@anthropic-ai/claude-code' }
-        'codex'    { Install-NpmGlobal '@openai/codex' }
-        'ccswitch' { Install-CcSwitch }
+        'claude'   { Ensure-Node; Configure-Npm; Install-NpmGlobal '@anthropic-ai/claude-code' }
+        'codex'    { Ensure-Node; Configure-Npm; Install-NpmGlobal '@openai/codex' }
+        # cc-switch 只下载安装包到「下载」文件夹（走 GitHub 代理链，不依赖 npm）
+        'ccswitch' { Download-CcSwitch }
         default { Die "未知组件：$comp（应为 all/claude/codex/ccswitch）" }
     }
 }
@@ -633,7 +630,6 @@ function Uninstall-Component([string]$comp) {
     }
 }
 
-# 更新单个组件（混合策略：能调自带 updater 就调，否则重装当前方式）
 # 更新单个组件（全部走国内镜像，不依赖外网）
 # 设计原则：原生安装的更新通道（downloads.claude.ai / claude update）走外网，
 # 国内通常连不上，所以对国内用户：npm 是唯一能稳定走镜像更新的方式。
@@ -678,11 +674,10 @@ function Update-Component([string]$comp) {
             Install-NpmGlobal '@openai/codex@latest'
         }
         'ccswitch' {
-            if (-not (Test-CcSwitchInstalled)) { Write-Warn2 'cc-switch 未安装，无法更新（请先安装）'; return }
-            # 桌面版无 CLI updater：卸载后重下最新 release（走 GitHub 代理链）
-            Write-Section '更新 cc-switch（卸载 + 重下最新 release）'
-            Uninstall-CcSwitch
-            Install-CcSwitch
+            # cc-switch 由用户手动安装，无 CLI updater：更新 = 重下最新安装包到「下载」文件夹，
+            # 用户自行双击覆盖安装即可。
+            Write-Section '下载 cc-switch 最新安装包（覆盖安装请手动双击）'
+            Download-CcSwitch
         }
         default { Die "未知组件：$comp" }
     }
@@ -731,7 +726,7 @@ function Invoke-VersionCheck {
     # cc-switch（桌面版无命令行版本输出，仅报告是否已装 + 最新 release tag）
     if (Test-CcSwitchInstalled) { Write-Ok 'cc-switch 桌面版：已安装' }
     else { Write-Warn2 'cc-switch 桌面版：未安装' }
-    $slatest = Get-CcSwitchLatestVersion
+    $slatest = Get-CcSwitchLatestTag
     Write-Host  "    最新版本：$(if($slatest){$slatest}else{'查询失败'})" -ForegroundColor DarkGray
 
     Write-Section '检查完成（未做任何改动，更新请用「更新」菜单/动作）'
