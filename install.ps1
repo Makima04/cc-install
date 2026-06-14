@@ -425,6 +425,67 @@ function Restore-Npmrc {
     }
 }
 
+# 检测 Claude Code 的安装方式：'native'（原生安装器）/ 'npm' / 'none'
+# 原生安装器把 claude.exe 放在 ~/.local/bin/，版本副本在 ~/.claude/local/
+# 用路径判断而非 claude doctor（后者有大量误报 bug，不可靠）
+function Get-ClaudeInstallType {
+    $cmd = Get-Command claude -ErrorAction SilentlyContinue
+    if (-not $cmd) { return 'none' }
+    $src = $cmd.Source
+    if ($src -match '\.local[\\/]+bin[\\/]+claude(\.exe)?$') { return 'native' }
+    # 兜底：命令路径不在 .local/bin 但存在版本副本目录 → 也算原生
+    $localDir = Join-Path $env:USERPROFILE '.claude\local'
+    if (Test-Path $localDir) { return 'native' }
+    return 'npm'
+}
+
+# 卸载 Claude Code 原生安装（文件级清理）
+# 注意：只删二进制 + 版本副本目录，绝不删 ~/.claude（含用户配置/数据）
+function Uninstall-ClaudeNative {
+    # 1) 杀掉运行中的 claude 进程，避免 Windows 文件锁导致删除失败
+    $procs = Get-Process claude -ErrorAction SilentlyContinue
+    if ($procs) {
+        Write-Log "终止 claude 进程（$($procs.Count) 个）..."
+        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+    }
+
+    # 2) 删启动器 ~/.local/bin/claude(.exe)
+    $binDir = Join-Path $env:USERPROFILE '.local\bin'
+    foreach ($name in @('claude.exe', 'claude')) {
+        $bin = Join-Path $binDir $name
+        if (Test-Path $bin) {
+            Remove-Item $bin -Force -ErrorAction SilentlyContinue
+            if (Test-Path $bin) {
+                Write-Warn2 "无法删除 $bin（可能被占用，请关闭所有 claude 进程后重试）"
+            } else {
+                Write-Ok "已删除 $bin"
+            }
+        }
+    }
+
+    # 3) 删版本副本目录 ~/.claude/local（不删 ~/.claude 本身！）
+    $localDir = Join-Path $env:USERPROFILE '.claude\local'
+    if (Test-Path $localDir) {
+        Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $localDir) {
+            Write-Warn2 "无法删除 $localDir（可能被占用）"
+        } else {
+            Write-Ok "已删除版本副本目录 $localDir"
+        }
+    }
+
+    # 4) PATH 不自动改：~/.local/bin 可能被其他工具共用（如本脚本的 cc-switch portable）
+    #    仅在日志里提示，用户可按需手动从用户 PATH 移除 ~/.local/bin
+    Write-Log '提示：~/.local/bin 未从 PATH 移除（可能被其他工具共用），如需可手动清理'
+
+    # 5) 校验：claude 命令是否真的不可用了
+    if (Test-Command claude) {
+        Write-Warn2 '卸载后 claude 命令仍可用，可能存在多份安装（如同时有 npm 版）。可重跑卸载。'
+    } else {
+        Write-Ok 'Claude Code 原生安装已清理'
+    }
+}
 # 删 cc-switch 桌面版：MSI 安装的从注册表卸载，portable 的删目录
 function Uninstall-CcSwitch {
     # 1) MSI 安装：从注册表找卸载串
@@ -474,11 +535,22 @@ function Uninstall-CcSwitch {
 function Invoke-Uninstall {
     Write-Section '卸载 Claude Code + Codex + cc-switch'
 
+    # Claude Code：按安装方式卸载（原生安装不依赖 npm，必须放在 npm 守卫之外）
+    $claudeType = Get-ClaudeInstallType
+    switch ($claudeType) {
+        'none'   { Write-Ok 'Claude Code：未安装，跳过' }
+        'native' {
+            Write-Warn2 '检测到 Claude Code 为原生安装（非 npm），改用文件清理方式'
+            Uninstall-ClaudeNative
+        }
+        'npm'    { Uninstall-NpmGlobal '@anthropic-ai/claude-code' }
+    }
+
+    # Codex 仅通过 npm 安装；无 npm 则跳过
     if (Test-Command npm) {
-        Uninstall-NpmGlobal '@anthropic-ai/claude-code'
         Uninstall-NpmGlobal '@openai/codex'
     } else {
-        Write-Warn2 '未检测到 npm，跳过 npm 包卸载'
+        Write-Warn2 '未检测到 npm，跳过 Codex 卸载'
     }
 
     Uninstall-CcSwitch
@@ -488,7 +560,7 @@ function Invoke-Uninstall {
     @"
 
 已清理：
-  • @anthropic-ai/claude-code
+  • Claude Code（npm 包，或 原生安装 ~/.local/bin + ~/.claude/local）
   • @openai/codex
   • cc-switch 桌面版
   • npm registry 配置（已还原/移除）
@@ -542,7 +614,12 @@ function Invoke-CheckOnly {
     Detect-Env
     Write-Section '当前已安装'
     if (Test-Command node)   { Write-Ok "Node.js $(node -v)" }       else { Write-Warn2 'Node.js：未安装' }
-    if (Test-Command claude) { Write-Ok "Claude Code：$(claude --version 2>&1 | Select-Object -First 1)" }
+    if (Test-Command claude) {
+        $cver = (claude --version 2>&1 | Select-Object -First 1)
+        $ctype = Get-ClaudeInstallType
+        $clabel = switch ($ctype) { 'native' { ' [原生安装]' } 'npm' { ' [npm]' } default { '' } }
+        Write-Ok "Claude Code：$cver$clabel"
+    }
     else { Write-Warn2 'Claude Code：未安装' }
     if (Test-Command codex)  { Write-Ok "Codex CLI：$(codex --version 2>&1 | Select-Object -First 1)" }
     else { Write-Warn2 'Codex CLI：未安装' }

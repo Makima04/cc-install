@@ -578,6 +578,53 @@ restore_npmrc() {
   fi
 }
 
+# 检测 Claude Code 的安装方式：'native' / 'npm' / 'none'
+# 原生安装（curl|bash 或官方安装器）的二进制在 ~/.local/bin/claude，版本副本在 ~/.claude/local/
+# 用路径判断而非 claude doctor（后者有大量误报 bug）
+claude_install_type() {
+  if ! have claude; then echo 'none'; return; fi
+  local src
+  src="$(command -v claude)"
+  case "$src" in
+    */.local/bin/claude) echo 'native'; return ;;
+  esac
+  # 兜底：命令不在 .local/bin 但存在版本副本目录 → 也算原生
+  if [[ -d "$HOME/.claude/local" ]]; then echo 'native'; return; fi
+  echo 'npm'
+}
+
+# 卸载 Claude Code 原生安装（文件级清理）
+# 注意：只删二进制 + 版本副本目录，绝不删 ~/.claude（含用户配置/数据）
+uninstall_claude_native() {
+  # 1) 杀掉运行中的 claude 进程，避免文件占用导致删除失败
+  if pgrep -x claude >/dev/null 2>&1; then
+    log "终止 claude 进程..."
+    pkill -x claude 2>/dev/null || true
+    sleep 0.5
+  fi
+
+  # 2) 删启动器 ~/.local/bin/claude
+  local bin="$HOME/.local/bin/claude"
+  if [[ -e "$bin" ]]; then
+    rm -f "$bin" && ok "已删除 $bin" || warn "无法删除 $bin（可能被占用）"
+  fi
+
+  # 3) 删版本副本目录 ~/.claude/local（不删 ~/.claude 本身！）
+  local local_dir="$HOME/.claude/local"
+  if [[ -d "$local_dir" ]]; then
+    rm -rf "$local_dir" && ok "已删除版本副本目录 $local_dir" || warn "无法删除 $local_dir"
+  fi
+
+  # 4) PATH 不自动改：~/.local/bin 可能被其他工具共用（如本脚本的 cc-switch）
+  log "提示：~/.local/bin 未从 PATH 移除（可能被其他工具共用），如需可手动清理"
+
+  # 5) 校验：claude 命令是否真的不可用了
+  if have claude; then
+    warn '卸载后 claude 命令仍可用，可能存在多份安装（如同时有 npm 版）。可重跑卸载。'
+  else
+    ok 'Claude Code 原生安装已清理'
+  fi
+}
 # 删 cc-switch 桌面版（macOS）
 uninstall_cc_switch_macos() {
   local found=0
@@ -657,12 +704,25 @@ remove_nvm_node() {
 uninstall() {
   section "卸载 Claude Code + Codex + cc-switch"
 
-  # 需要可用的 node/npm 才能卸 npm 包；没有就直接跳到删桌面版 + 还原配置
+  # Claude Code 按安装方式卸载（原生安装走文件清理，不依赖 npm）；
+  # Codex 必须有 npm 才能卸。下面两者分开处理。
+  # Claude Code：按安装方式卸载（原生安装不依赖 npm，必须放在 npm 守卫之外）
+  local claude_type
+  claude_type="$(claude_install_type)"
+  case "$claude_type" in
+    none)   ok "Claude Code：未安装，跳过" ;;
+    native)
+      warn "检测到 Claude Code 为原生安装（非 npm），改用文件清理方式"
+      uninstall_claude_native
+      ;;
+    npm)    npm_uninstall_global "@anthropic-ai/claude-code" ;;
+  esac
+
+  # Codex 仅通过 npm 安装；无 npm 则跳过
   if have npm; then
-    npm_uninstall_global "@anthropic-ai/claude-code"
     npm_uninstall_global "@openai/codex"
   else
-    warn "未检测到 npm，跳过 npm 包卸载（命令行工具可能已随 Node 一并移除）"
+    warn "未检测到 npm，跳过 Codex 卸载（命令行工具可能已随 Node 一并移除）"
   fi
 
   case "$OS_KIND" in
@@ -676,7 +736,7 @@ uninstall() {
   cat <<EOF
 
 ${c_dim}已清理：${color_reset}
-  ${c_dim}•${color_reset} @anthropic-ai/claude-code
+  ${c_dim}•${color_reset} Claude Code（npm 包，或 原生安装 ~/.local/bin + ~/.claude/local）
   ${c_dim}•${color_reset} @openai/codex
   ${c_dim}•${color_reset} cc-switch（$(cc_switch_mode_label)）
   ${c_dim}•${color_reset} npm registry 配置（已还原/移除）
@@ -738,7 +798,13 @@ run_check_only() {
   detect_env
   section "当前已安装"
   if have node; then ok "Node.js $(node -v)"; else warn "Node.js：未安装"; fi
-  if have claude; then ok "Claude Code：$(claude --version 2>&1 | head -1)"; else warn "Claude Code：未安装"; fi
+  if have claude; then
+    local cver ctype clabel
+    cver="$(claude --version 2>&1 | head -1)"
+    ctype="$(claude_install_type)"
+    case "$ctype" in native) clabel=" [原生安装]";; npm) clabel=" [npm]";; *) clabel="";; esac
+    ok "Claude Code：$cver$clabel"
+  else warn "Claude Code：未安装"; fi
   if have codex; then ok "Codex CLI：$(codex --version 2>&1 | head -1)"; else warn "Codex CLI：未安装"; fi
   if cc_switch_already_installed; then ok "cc-switch：已安装（$(cc_switch_mode_label)）"; else warn "cc-switch $(cc_switch_mode_label)：未安装"; fi
   section "检查完成（未做任何改动）"
