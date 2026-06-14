@@ -20,8 +20,37 @@
 
 ### macOS / Linux
 
+**方式一：一行命令（直接从 GitHub 拉取）**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Makima04/cc-install/main/install.sh | bash
+```
+
+**方式二：国内镜像加速（推荐，GitHub 在国内不稳定时用）**
+
+国内访问 `raw.githubusercontent.com` 经常超时或龟速，可用下面任一镜像源：
+
+```bash
+# jsDelivr CDN（国内通用，稳定，永久缓存）
+curl -fsSL https://cdn.jsdelivr.net/gh/Makima04/cc-install@main/install.sh | bash
+
+# GitHub 代理（实测最快，社区维护，偶尔不稳）
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/Makima04/cc-install/main/install.sh | bash
+```
+
+> ⚠️ **`curl | bash` 无法交互**：管道方式下脚本的 stdin 被 curl 占用，菜单选择会立即"退出"。
+> 如需使用交互菜单（选择安装/卸载/检查），请用下面的**方式三**先下载到本地再运行。
+
+**方式三：先下载再运行（支持交互菜单，最稳）**
+
+```bash
+# 国内镜像下载（jsDelivr，推荐）
+curl -fsSL https://cdn.jsdelivr.net/gh/Makima04/cc-install@main/install.sh -o install.sh
+bash install.sh
+
+# 或 GitHub 直连（国外/有代理）
+curl -fsSL https://raw.githubusercontent.com/Makima04/cc-install/main/install.sh -o install.sh
+bash install.sh
 ```
 
 或 clone 后本地运行：
@@ -36,13 +65,23 @@ bash install.sh
 
 ### Windows（PowerShell）
 
+**方式一：一行命令（从 GitHub 拉取）**
+
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1).TrimStart([char]0xFEFF)))
 ```
 
-或本地运行：
+**方式二：国内镜像加速（GitHub 不稳定时用）**
 
 ```powershell
+# jsDelivr CDN（国内通用，稳定）
+& ([scriptblock]::Create((irm https://cdn.jsdelivr.net/gh/Makima04/cc-install@main/install.ps1).TrimStart([char]0xFEFF)))
+```
+
+**方式三：先下载再运行（支持交互菜单，最稳）**
+
+```powershell
+irm https://cdn.jsdelivr.net/gh/Makima04/cc-install@main/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
@@ -165,6 +204,7 @@ Claude Code 原本只认 Anthropic 协议，所以国产模型厂商都提供了
 
 | 资源 | 镜像源 | 备注 |
 |------|--------|------|
+| **下载本脚本** | `cdn.jsdelivr.net/gh/Makima04/cc-install@main`（jsDelivr） | 国内访问 GitHub 不稳定时用，见上方「快速开始」 |
 | npm 包 | `registry.npmmirror.com`（淘宝） | 免费、稳定 |
 | Node 二进制（Win） | `registry.npmmirror.com/-/binary/node` | 同上 |
 | nvm 安装脚本（Mac/Linux） | Gitee nvm 镜像 | 避开被墙的 `raw.githubusercontent.com` |
@@ -173,9 +213,28 @@ Claude Code 原本只认 Anthropic 协议，所以国产模型厂商都提供了
 
 **GitHub 代理说明**：cc-switch 的 Windows/Linux 桌面包来自 GitHub Releases，国内直连慢。脚本内置 3 个社区代理 + 直连回退，逐一尝试。代理不稳定时可用 `GH_PROXY` 环境变量指定你常用的那个。
 
+**下载脚本本身的镜像**：本仓库的 `install.sh` / `install.ps1` 托管在 GitHub，国内直连 `raw.githubusercontent.com` 可能超时或龟速。可用 [jsDelivr](https://www.jsdelivr.com/)（全球 CDN，国内有节点，永久缓存 GitHub 仓库）或 GitHub 代理加速，命令见「快速开始」。jsDelivr 的 URL 格式为 `https://cdn.jsdelivr.net/gh/<用户>/<仓库>@<分支>/<文件>`。
+
 ---
 
 ## ❓ 常见问题
+
+### Q0：用 `curl | bash` 跑起来后菜单"还没选就退出"了？
+
+这是 `curl ... | bash` 的固有限制：管道方式下脚本的 stdin 被 curl 的输出占用，菜单里的交互读取（`read`）拿不到键盘输入，会立即走到"退出"分支。
+
+**解决**：改用「先下载再运行」，让 stdin 留给键盘交互：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/Makima04/cc-install@main/install.sh -o install.sh
+bash install.sh
+```
+
+或者跳过菜单直接指定动作（`curl | bash` 下这种用法没问题）：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/Makima04/cc-install@main/install.sh | NONINTERACTIVE=1 bash -s install
+```
 
 ### Q1：装完 `claude`/`codex` 命令找不到？
 
