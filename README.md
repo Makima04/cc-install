@@ -68,14 +68,16 @@ bash install.sh
 **方式一：一行命令（从 GitHub 拉取）**
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1).TrimStart([char]0xFEFF)))
+& ([scriptblock]::Create([System.Text.Encoding]::UTF8.GetString((Invoke-WebRequest https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1 -UseBasicParsing).RawContentStream.ToArray()).TrimStart([char]0xFEFF)))
 ```
+
+> 注：不直接用 `irm` 是因为 PowerShell 5.1 下 `irm` 解码 UTF-8 BOM 有 bug（BOM 三字节未被合并为单字符，导致 `TrimStart` 失效、脚本解析报错）。上面的写法取原始字节后显式按 UTF-8 解码，兼容 PS 5.1 与 PS 7。
 
 **方式二：国内镜像加速（GitHub 不稳定时用）**
 
 ```powershell
 # jsDelivr CDN（国内通用，稳定）
-& ([scriptblock]::Create((irm https://cdn.jsdelivr.net/gh/Makima04/cc-install@main/install.ps1).TrimStart([char]0xFEFF)))
+& ([scriptblock]::Create([System.Text.Encoding]::UTF8.GetString((Invoke-WebRequest https://cdn.jsdelivr.net/gh/Makima04/cc-install@main/install.ps1 -UseBasicParsing).RawContentStream.ToArray()).TrimStart([char]0xFEFF)))
 ```
 
 **方式三：先下载再运行（支持交互菜单，最稳）**

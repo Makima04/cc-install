@@ -7,8 +7,8 @@
     版本：1.1.0
     要求：Windows 10/11，PowerShell 5.1+（或 PowerShell 7+）
 .EXAMPLE
-    # 一行命令（推荐）
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1).TrimStart([char]0xFEFF)))
+    # 一行命令（推荐）—— 兼容 PS 5.1 / 7（取原始字节后显式 UTF8 解码，规避 irm 的 BOM bug）
+    & ([scriptblock]::Create([System.Text.Encoding]::UTF8.GetString((Invoke-WebRequest https://raw.githubusercontent.com/Makima04/cc-install/main/install.ps1 -UseBasicParsing).RawContentStream.ToArray()).TrimStart([char]0xFEFF)))
 
     # 本地运行
     powershell -ExecutionPolicy Bypass -File .\install.ps1
